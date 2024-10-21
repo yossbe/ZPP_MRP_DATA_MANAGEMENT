@@ -1,0 +1,651 @@
+REPORT zpp_mrp_data_management.
+
+*----------------------------------------------------------------------*
+* Program: ZPP_MRP_DATA_MANAGEMENT
+* Author: [Yossi]
+* Date: [02/09/2024]
+* Description: This program provides functionality to upload, download,
+*              and display MRP data from/to the ZPP_MRP_DATA table.
+*----------------------------------------------------------------------*
+
+*----------------------------------------------------------------------*
+* Type Definitions
+*----------------------------------------------------------------------*
+TYPES: BEGIN OF ty_mrp_data,
+         matnr       TYPE matnr,    " Material Number
+         werks       TYPE werks_d,  " Plant
+         zgroup      TYPE zgroup,  " Custom field (adjust type if needed)
+         zmrp_status TYPE zmrp_status,  " Custom field (adjust type if needed)
+       END OF ty_mrp_data.
+
+
+TYPES: BEGIN OF ty_success_log,
+         matnr  TYPE matnr,
+         werks  TYPE werks_d,
+         berid  TYPE berid,
+         status TYPE string,
+       END OF ty_success_log,
+       BEGIN OF ty_error_log,
+         row     TYPE i,
+         message TYPE string,
+       END OF ty_error_log.
+
+TYPES: BEGIN OF ty_upload_result,
+         matnr    TYPE matnr,
+         werks    TYPE werks_d,
+         berid    TYPE berid,
+         status   TYPE string,
+         is_error TYPE abap_bool,
+         message  TYPE string,
+       END OF ty_upload_result.
+
+
+TYPES: BEGIN OF ty_display,
+         matnr       TYPE matnr,
+         werks       TYPE werks_d,
+         berid       TYPE berid,
+         ztar_day    TYPE ztar_day,
+         zmax_day    TYPE zmax_day,
+         zgroup      TYPE zgroup,
+         zcommnent   TYPE zhr_comments,
+         zmrp_status TYPE zmrp_status,
+         zcal_type   TYPE zcal_type,
+         zaverage_p  TYPE zaverage_p,
+         zsafety_p   TYPE zsafety_p,
+         zassembly   TYPE zassembly,
+         maktx       TYPE maktx,
+       END OF ty_display.
+
+TYPES: ty_t_zpp_md07_add TYPE TABLE OF zpp_md07_add WITH DEFAULT KEY,
+       ty_t_display      TYPE TABLE OF ty_display WITH DEFAULT KEY,
+       ty_t_errors       TYPE TABLE OF string WITH DEFAULT KEY.
+*----------------------------------------------------------------------*
+* Global Data Declarations
+*----------------------------------------------------------------------*
+TABLES: marc ,zpp_md07_add.
+
+DATA: "gt_mrp_data     TYPE TABLE OF ty_mrp_data,  " Table to hold MRP data
+  gt_mrp_data    TYPE TABLE OF ty_display, "zpp_md07_add,
+  gt_raw_data    TYPE truxs_t_text_data,     " Table to hold raw Excel data
+  go_alv         TYPE REF TO cl_salv_table,  " ALV Grid object
+  go_spreadsheet TYPE REF TO cl_fdt_xl_spreadsheet,  " Excel handling object
+  gv_file_path   TYPE string.                " File path for upload/download
+
+*----------------------------------------------------------------------*
+* Selection Screen Definition
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
+PARAMETERS: p_upl  RADIOBUTTON GROUP grp1 DEFAULT 'X' USER-COMMAND cmd,
+            p_down RADIOBUTTON GROUP grp1,
+            p_disp RADIOBUTTON GROUP grp1.
+
+
+PARAMETERS: p_file TYPE string LOWER CASE MODIF ID fil .
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE TEXT-001.
+PARAMETERS:     p_werks TYPE werks_d OBLIGATORY.
+SELECT-OPTIONS: s_matnr  FOR marc-matnr,
+                s_zcal_t FOR zpp_md07_add-zcal_type,
+                s_zgroup FOR zpp_md07_add-zgroup.
+
+SELECTION-SCREEN END OF BLOCK b2.
+*----------------------------------------------------------------------*
+* Initialization
+*----------------------------------------------------------------------*
+INITIALIZATION.
+*  TEXT-001 = 'MRP Data Management'.
+
+*----------------------------------------------------------------------*
+* Selection Screen Output Event
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN OUTPUT.
+  " Deactivate file input field when display option is selected
+  LOOP AT SCREEN.
+    IF screen-group1 = 'FIL' AND p_disp = 'X'.
+      screen-active = 0.
+      MODIFY SCREEN.
+    ELSE.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+*----------------------------------------------------------------------*
+* Selection Screen VALUE-REQUEST Event
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+  PERFORM f4_file_selection CHANGING p_file.
+
+FORM f4_file_selection CHANGING p_filename TYPE string.
+  DATA: lv_rc         TYPE i,
+        lt_file_table TYPE filetable,
+        ls_file_table TYPE file_table,
+        lv_action     TYPE i.
+
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+      window_title            = 'Select File'
+      default_extension       = '*.xlsx'
+      file_filter             = 'All Files (*.*)|*.*'
+      initial_directory       = 'C:\'
+    CHANGING
+      file_table              = lt_file_table
+      rc                      = lv_rc
+      user_action             = lv_action
+    EXCEPTIONS
+      file_open_dialog_failed = 1
+      cntl_error              = 2
+      error_no_gui            = 3
+      not_supported_by_gui    = 4
+      OTHERS                  = 5.
+
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  IF lv_action = cl_gui_frontend_services=>action_ok.
+    READ TABLE lt_file_table INTO ls_file_table INDEX 1.
+    IF sy-subrc = 0.
+      p_filename = ls_file_table-filename.
+    ENDIF.
+  ENDIF.
+ENDFORM.
+
+
+
+*----------------------------------------------------------------------*
+* Start-of-Selection Event
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+  "verify file path exist
+  IF p_file IS INITIAL AND ( p_upl = 'X' OR p_down = 'X' ).
+    MESSAGE TEXT-010 TYPE 'E'. "'Please enter File path'
+  ENDIF.
+
+
+
+  CASE abap_true.
+    WHEN p_upl.
+      PERFORM upload_data.
+    WHEN p_down.
+      PERFORM download_data.
+    WHEN p_disp.
+      PERFORM display_data.
+  ENDCASE.
+
+*----------------------------------------------------------------------*
+* Form: UPLOAD_DATA
+* Description: Reads data from an Excel file and updates the ZPP_MRP_DATA table
+*----------------------------------------------------------------------*
+FORM upload_data.
+  DATA: lt_raw_data      TYPE solix_tab,
+        lo_excel         TYPE REF TO cl_fdt_xl_spreadsheet,
+        lt_worksheets    TYPE string_table,
+        lv_worksheetname TYPE string,
+        lo_data_ref      TYPE REF TO data,
+        lv_error         TYPE abap_bool,
+        lt_errors        TYPE TABLE OF string,
+        lv_error_message TYPE string.
+
+  FIELD-SYMBOLS: <lfs_data_tab> TYPE STANDARD TABLE,
+                 <ls_excel_row> TYPE any,
+                 <ls_mrp_data>  TYPE ty_display. "zpp_md07_add.
+
+  AUTHORITY-CHECK OBJECT 'M_MATE_STA'
+             ID 'ACTVT' FIELD '02' "change
+             ID 'STATM' FIELD 'D'. "MRP
+  IF sy-subrc <> 0.
+    MESSAGE 'Not authorized to change master data (transaction MM02)' TYPE 'E'.
+    RETURN.
+  ENDIF.
+
+  AUTHORITY-CHECK OBJECT 'M_MATE_WRK' "Check if the user has autorization for the plant.
+          ID 'ACTVT' FIELD '03'
+          ID 'WERKS' FIELD p_werks.
+  IF sy-subrc <> 0.
+    MESSAGE 'Not authorized to for this plant' TYPE 'E'.
+    RETURN.
+  ENDIF.
+  gv_file_path = p_file.
+
+  TRY.
+      " Step 1: Read the Excel file
+      cl_gui_frontend_services=>gui_upload(
+        EXPORTING
+          filename                = gv_file_path
+          filetype                = 'BIN'
+        IMPORTING
+      filelength = DATA(lv_file_length)
+      header   = DATA(lv_xstring_header)
+*          filelength              = lv_filelength
+        CHANGING
+          data_tab                = lt_raw_data
+        EXCEPTIONS
+          file_open_error         = 1
+          file_read_error         = 2
+          no_batch                = 3
+          gui_refuse_filetransfer = 4
+          invalid_type            = 5
+          no_authority            = 6
+          unknown_error           = 7
+          bad_data_format         = 8
+          header_not_allowed      = 9
+          separator_not_allowed   = 10
+          header_too_long         = 11
+          unknown_dp_error        = 12
+          access_denied           = 13
+          dp_out_of_memory        = 14
+          disk_full               = 15
+          dp_timeout              = 16
+          not_supported_by_gui    = 17
+          error_no_gui            = 18
+          OTHERS                  = 19
+      ).
+      IF sy-subrc <> 0.
+        MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+          WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+        RETURN.
+      ENDIF.
+
+      " Convert binary data to xstring
+      CALL FUNCTION 'SCMS_BINARY_TO_XSTRING'
+        EXPORTING
+          input_length = lv_file_length
+        IMPORTING
+          buffer       = lv_xstring_header
+        TABLES
+          binary_tab   = lt_raw_data
+        EXCEPTIONS
+          failed       = 1
+          OTHERS       = 2.
+      IF sy-subrc <> 0.
+        MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+          WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+        RETURN.
+      ENDIF.
+
+      " Step 2: Create Excel object and get worksheet
+      lo_excel = NEW cl_fdt_xl_spreadsheet(
+                       document_name = p_file
+                       xdocument     = lv_xstring_header ) .
+*
+      lo_excel->if_fdt_doc_spreadsheet~get_worksheet_names(
+        IMPORTING
+          worksheet_names = lt_worksheets ).
+
+      lv_worksheetname = lt_worksheets[ 1 ].  "Read first sheet
+
+      lo_data_ref = lo_excel->if_fdt_doc_spreadsheet~get_itab_from_worksheet( lv_worksheetname ).
+      ASSIGN lo_data_ref->* TO <lfs_data_tab>.
+      " Step 3: Process Excel data
+      LOOP AT <lfs_data_tab> ASSIGNING <ls_excel_row> FROM 2.  " Skip header row
+        CLEAR: lv_error, lv_error_message.
+        APPEND INITIAL LINE TO gt_mrp_data ASSIGNING <ls_mrp_data>.
+
+        " Assign values from Excel to MRP data structure
+        PERFORM assign_and_validate_field USING 'A' 'MATNR' <ls_excel_row> <ls_mrp_data> CHANGING  lv_error_message.
+        PERFORM assign_and_validate_field USING 'B' 'WERKS' <ls_excel_row> <ls_mrp_data> CHANGING lv_error_message.
+        PERFORM assign_and_validate_field USING 'C' 'BERID' <ls_excel_row> <ls_mrp_data> CHANGING lv_error_message.
+        PERFORM assign_and_validate_field USING 'D' 'ZTAR_DAY' <ls_excel_row> <ls_mrp_data> CHANGING lv_error_message.
+        PERFORM assign_and_validate_field USING 'E' 'ZMAX_DAY' <ls_excel_row> <ls_mrp_data> CHANGING lv_error_message.
+        PERFORM assign_and_validate_field USING 'F' 'ZGROUP' <ls_excel_row> <ls_mrp_data> CHANGING lv_error_message.
+        PERFORM assign_and_validate_field USING 'G' 'ZCOMMNENT' <ls_excel_row> <ls_mrp_data> CHANGING lv_error_message.
+        PERFORM assign_and_validate_field USING 'H' 'ZMRP_STATUS' <ls_excel_row> <ls_mrp_data> CHANGING lv_error_message.
+        PERFORM assign_and_validate_field USING 'I' 'ZCAL_TYPE' <ls_excel_row> <ls_mrp_data> CHANGING lv_error_message.
+        PERFORM assign_and_validate_field USING 'J' 'ZAVERAGE_P' <ls_excel_row> <ls_mrp_data> CHANGING lv_error_message.
+        PERFORM assign_and_validate_field USING 'K' 'ZSAFETY_P' <ls_excel_row> <ls_mrp_data> CHANGING lv_error_message.
+        PERFORM assign_and_validate_field USING 'L' 'ZASSEMBLY' <ls_excel_row> <ls_mrp_data> CHANGING lv_error_message.
+
+        IF lv_error_message IS NOT INITIAL.
+          APPEND |Row { sy-tabix }: { lv_error_message }| TO lt_errors.
+          CONTINUE.
+        ENDIF.
+      ENDLOOP.
+      DELETE gt_mrp_data WHERE matnr IS INITIAL.
+      " Additional validation
+      SELECT matnr, werks
+        FROM marc
+        FOR ALL ENTRIES IN @gt_mrp_data
+        WHERE matnr = @gt_mrp_data-matnr
+          AND werks = @gt_mrp_data-werks
+        INTO TABLE @DATA(lt_valid_combinations).
+
+      DATA(counter) = 1.
+      LOOP AT gt_mrp_data ASSIGNING <ls_mrp_data>.
+        READ TABLE lt_valid_combinations WITH KEY matnr = <ls_mrp_data>-matnr
+                                                  werks = <ls_mrp_data>-werks
+                                         TRANSPORTING NO FIELDS.
+        IF sy-subrc <> 0.
+          APPEND |Row { counter }: Invalid material/plant combination { <ls_mrp_data>-matnr }/ { <ls_mrp_data>-werks }| TO lt_errors.
+          DELETE gt_mrp_data.
+        ENDIF.
+        counter = counter + 1.
+      ENDLOOP.
+
+      " Step 4: Update database
+      IF gt_mrp_data IS NOT INITIAL.
+        MODIFY zpp_md07_add FROM TABLE gt_mrp_data.
+*        PERFORM log_successful_upload USING gt_mrp_data.
+        IF sy-subrc = 0.
+          COMMIT WORK.
+          MESSAGE 'MRP data uploaded successfully' TYPE 'S'.
+        ELSE.
+          ROLLBACK WORK.
+          MESSAGE 'Error uploading MRP data' TYPE 'E'.
+        ENDIF.
+      ELSE.
+        MESSAGE 'No valid data to upload' TYPE 'W'.
+      ENDIF.
+
+      PERFORM display_upload_summary
+        USING
+          gt_mrp_data  " Table of successfully uploaded records
+          lt_errors.   " Table of error messages
+
+    CATCH cx_root INTO DATA(lx_error).
+      MESSAGE lx_error->get_text( ) TYPE 'E'.
+  ENDTRY.
+ENDFORM.
+
+FORM assign_and_validate_field USING iv_column_letter TYPE string
+                                     iv_field_name TYPE string
+                                     is_excel_row TYPE any
+                                     CHANGING cs_mrp_data TYPE ty_display "zpp_md07_add
+*                                              cv_error TYPE abap_bool
+                                              cv_error_message TYPE string.
+
+  FIELD-SYMBOLS: <fs_value> TYPE any.
+  DATA: lv_value TYPE string.
+
+  ASSIGN COMPONENT iv_column_letter OF STRUCTURE is_excel_row TO <fs_value>.
+  IF sy-subrc = 0.
+    lv_value = <fs_value>.
+
+    CASE iv_field_name.
+      WHEN 'ZTAR_DAY' OR 'ZMAX_DAY' OR 'ZAVERAGE_P' OR 'ZSAFETY_P'.
+        " Handle numeric fields with potential thousand separators
+        REPLACE ALL OCCURRENCES OF ',' IN lv_value WITH ''.
+        TRY.
+            ASSIGN COMPONENT iv_field_name OF STRUCTURE cs_mrp_data TO <fs_value>.
+*            <fs_value> = |{ lv_value COUNTRY = 'US' NUMBER = 'USER' }|.
+            <fs_value> = lv_value.
+          CATCH cx_sy_conversion_error INTO DATA(lx_conversion_error).
+*            cv_error = abap_true.
+            cv_error_message = |Error converting { iv_field_name }: { lx_conversion_error->get_text( ) }|.
+        ENDTRY.
+      WHEN 'MATNR' OR 'WERKS' OR 'ZASSEMBLY'.
+        ASSIGN COMPONENT iv_field_name OF STRUCTURE cs_mrp_data TO <fs_value>.
+        <fs_value> = |{ lv_value ALPHA = IN }|.
+      WHEN OTHERS.
+        " For other fields, simply assign the value
+        ASSIGN COMPONENT iv_field_name OF STRUCTURE cs_mrp_data TO <fs_value>.
+        <fs_value> = lv_value.
+    ENDCASE.
+  ELSE.
+*    cv_error = abap_true.
+    cv_error_message = |Column { iv_column_letter } not found in Excel row|.
+  ENDIF.
+ENDFORM.
+
+FORM display_upload_summary
+  USING
+    pt_mrp_data TYPE ty_t_display "ty_t_zpp_md07_add
+    pt_errors   TYPE ty_t_errors.
+
+  TYPES: BEGIN OF ty_colored_result,
+           matnr    TYPE matnr,
+           werks    TYPE werks_d,
+           berid    TYPE berid,
+
+         ztar_day    TYPE ztar_day,
+         zmax_day    TYPE zmax_day,
+         zgroup      TYPE zgroup,
+         zcommnent   TYPE zhr_comments,
+         zmrp_status TYPE zmrp_status,
+         zcal_type   TYPE zcal_type,
+         zaverage_p  TYPE zaverage_p,
+         zsafety_p   TYPE zsafety_p,
+         zassembly   TYPE zassembly,
+         maktx       TYPE maktx,
+
+           status   TYPE string,
+           is_error TYPE abap_bool,
+           message  TYPE string,
+           color    TYPE lvc_t_scol,
+         END OF ty_colored_result.
+
+  DATA: lt_colored_results TYPE TABLE OF ty_colored_result,
+        ls_colored_result  TYPE ty_colored_result,
+        ls_color           TYPE lvc_s_scol,
+        lv_row_str         TYPE string,
+        lo_alv             TYPE REF TO cl_salv_table,
+        lo_columns         TYPE REF TO cl_salv_columns_table,
+        lo_column          TYPE REF TO cl_salv_column_table,
+        lo_functions       TYPE REF TO cl_salv_functions_list.
+
+  " Prepare colored results
+  LOOP AT pt_mrp_data INTO DATA(ls_mrp_data).
+    CLEAR: ls_colored_result, ls_color.
+    MOVE-CORRESPONDING ls_mrp_data TO ls_colored_result.
+    ls_colored_result-status = 'Successfully uploaded'.
+    ls_colored_result-is_error = abap_false.
+    " Set green color for successful uploads
+    ls_color-color-col = 5.  " Green
+    ls_color-color-int = 0.
+    ls_color-color-inv = 0.
+    APPEND ls_color TO ls_colored_result-color.
+    APPEND ls_colored_result TO lt_colored_results.
+  ENDLOOP.
+
+  " Add errors to colored results
+  LOOP AT pt_errors INTO DATA(lv_error_message).
+    CLEAR: ls_colored_result, ls_color, lv_row_str.
+    SPLIT lv_error_message AT ':' INTO lv_row_str ls_colored_result-message.
+    REPLACE ALL OCCURRENCES OF 'Row ' IN lv_row_str WITH ''.
+    ls_colored_result-status = |Error in row { lv_row_str }|.
+    ls_colored_result-is_error = abap_true.
+    CONDENSE ls_colored_result-message.
+    " Set red color for errors
+    ls_color-color-col = 6.  " Red
+    ls_color-color-int = 0.
+    ls_color-color-inv = 0.
+    APPEND ls_color TO ls_colored_result-color.
+    APPEND ls_colored_result TO lt_colored_results.
+  ENDLOOP.
+
+  TRY.
+      " Create ALV instance
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = lo_alv
+        CHANGING
+          t_table      = lt_colored_results ).
+
+      " Get columns object
+      lo_columns = lo_alv->get_columns( ).
+
+      " Adjust column properties
+      lo_columns->set_optimize( ).
+
+      lo_column ?= lo_columns->get_column( 'STATUS' ).
+      lo_column->set_long_text( 'Upload Status' ).
+
+      lo_column ?= lo_columns->get_column( 'IS_ERROR' ).
+      lo_column->set_technical( ). " Hide this column
+
+      lo_column ?= lo_columns->get_column( 'MESSAGE' ).
+      lo_column->set_long_text( 'Error Message' ).
+
+      " Set color column
+      lo_alv->get_columns( )->set_color_column( 'COLOR' ).
+
+      " Enable standard ALV toolbar
+      lo_functions = lo_alv->get_functions( ).
+      lo_functions->set_all( abap_true ).
+
+      " Set ALV title
+      lo_alv->get_display_settings( )->set_list_header( 'Upload Summary' ).
+
+      " Display the ALV
+      lo_alv->display( ).
+
+    CATCH cx_salv_msg INTO DATA(lx_error).
+      MESSAGE lx_error->get_text( ) TYPE 'E'.
+    CATCH cx_salv_not_found INTO DATA(lx_error2).
+      MESSAGE lx_error2->get_text( ) TYPE 'E'.
+    CATCH cx_salv_data_error INTO DATA(lx_error3).
+      MESSAGE lx_error3->get_text( ) TYPE 'E'.
+  ENDTRY.
+ENDFORM.
+
+
+*----------------------------------------------------------------------*
+* Form: DOWNLOAD_DATA
+* Description: Exports data from ZPP_MRP_DATA table to an Excel file
+*----------------------------------------------------------------------*
+FORM download_data.
+
+  DATA: lv_xstring    TYPE xstring,
+        lt_binary_tab TYPE solix_tab,
+        lv_file_size  TYPE i.
+
+  " Step 1: Fetch data from ZPP_MD07_ADD table
+  SELECT marc~matnr, marc~werks ,berid , ztar_day , zmax_day , zgroup ,
+       zcommnent , zmrp_status , zcal_type , zaverage_p , zsafety_p , zassembly, maktx
+  FROM marc LEFT JOIN zpp_md07_add
+    ON marc~matnr = zpp_md07_add~matnr AND
+       marc~werks = zpp_md07_add~werks
+  INNER JOIN makt ON marc~matnr = makt~matnr
+  WHERE marc~matnr     IN @s_matnr    AND
+        zcal_type IN @s_zcal_t   AND
+        zgroup    IN @s_zgroup   AND
+        marc~werks     =  @p_werks    AND
+        spras     = @sy-langu
+  INTO TABLE @gt_mrp_data.
+
+  TRY.
+      " Step 2: Create ALV object for data handling
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = go_alv
+        CHANGING
+          t_table      = gt_mrp_data ).
+
+      " Step 3: Get column information
+      DATA(lo_columns) = go_alv->get_columns( ).
+      DATA(lt_fieldcat) = cl_salv_controller_metadata=>get_lvc_fieldcatalog(
+        r_columns      = lo_columns
+        r_aggregations = go_alv->get_aggregations( ) ).
+
+      " Step 4: Prepare data for Excel export
+      DATA(lo_result) = cl_salv_ex_util=>factory_result_data_table(
+        r_data         = REF #( gt_mrp_data )
+        t_fieldcatalog = lt_fieldcat ).
+
+      " Step 5: Convert data to Excel format
+      cl_salv_bs_tt_util=>if_salv_bs_tt_util~transform(
+        EXPORTING
+          xml_type      = if_salv_bs_xml=>c_type_xlsx
+          xml_version   = cl_salv_bs_a_xml_base=>get_version( )
+          r_result_data = lo_result
+          xml_flavour   = if_salv_bs_c_tt=>c_tt_xml_flavour_export
+          gui_type      = if_salv_bs_xml=>c_gui_type_gui
+        IMPORTING
+          xml           = lv_xstring ).
+
+      " Step 6: Convert xstring to binary
+      CALL FUNCTION 'SCMS_XSTRING_TO_BINARY'
+        EXPORTING
+          buffer        = lv_xstring
+        IMPORTING
+          output_length = lv_file_size
+        TABLES
+          binary_tab    = lt_binary_tab.
+
+      " Step 7: Download Excel file
+      cl_gui_frontend_services=>gui_download(
+        EXPORTING
+          bin_filesize = lv_file_size
+          filename     = p_file
+          filetype     = 'BIN'
+        CHANGING
+          data_tab     = lt_binary_tab
+        EXCEPTIONS
+          file_write_error      = 1
+          no_batch              = 2
+          gui_refuse_filetransfer = 3
+          invalid_type          = 4
+          no_authority          = 5
+          unknown_error         = 6
+          header_not_allowed    = 7
+          separator_not_allowed = 8
+          filesize_not_allowed  = 9
+          header_too_long       = 10
+          dp_error_create       = 11
+          dp_error_send         = 12
+          dp_error_write        = 13
+          unknown_dp_error      = 14
+          access_denied         = 15
+          dp_out_of_memory      = 16
+          disk_full             = 17
+          dp_timeout            = 18
+          file_not_found        = 19
+          dataprovider_exception = 20
+          control_flush_error   = 21
+          not_supported_by_gui  = 22
+          error_no_gui          = 23
+          OTHERS                = 24 ).
+
+      IF sy-subrc <> 0.
+        MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+          WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      ELSE.
+        MESSAGE 'MRP data downloaded successfully' TYPE 'S'.
+      ENDIF.
+
+    CATCH cx_root INTO DATA(lx_error).
+      MESSAGE lx_error->get_text( ) TYPE 'E'.
+  ENDTRY.
+ENDFORM.
+
+*----------------------------------------------------------------------*
+* Form: DISPLAY_DATA
+* Description: Displays data from ZPP_MRP_DATA table using ALV Grid
+*----------------------------------------------------------------------*
+FORM display_data.
+  " Step 1: Fetch data from ZPP_MRP_DATA table
+
+  SELECT  marc~matnr, marc~werks ,berid , ztar_day , zmax_day , zgroup ,
+       zcommnent , zmrp_status , zcal_type , zaverage_p , zsafety_p , zassembly, maktx
+  FROM marc LEFT JOIN zpp_md07_add
+    ON marc~matnr = zpp_md07_add~matnr AND
+       marc~werks = zpp_md07_add~werks
+  INNER JOIN makt ON marc~matnr = makt~matnr
+  WHERE marc~matnr     IN @s_matnr    AND
+        zcal_type IN @s_zcal_t   AND
+        zgroup    IN @s_zgroup   AND
+        marc~werks     =  @p_werks    AND
+        spras     = @sy-langu
+  INTO TABLE @gt_mrp_data.
+
+
+  TRY.
+      " Step 2: Create ALV Grid object
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = go_alv
+        CHANGING
+          t_table      = gt_mrp_data ).
+
+      " Step 3: Configure ALV Grid
+      go_alv->get_functions( )->set_all( abap_true ).  " Enable all buttons
+      go_alv->get_columns( )->set_optimize( abap_true ).  " Optimize column widths
+
+      " Step 4: Display ALV Grid
+      go_alv->display( ).
+
+    CATCH cx_salv_msg INTO DATA(lx_error).
+      MESSAGE lx_error->get_text( ) TYPE 'E'.
+  ENDTRY.
+ENDFORM.
